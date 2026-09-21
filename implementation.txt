@@ -1,0 +1,682 @@
+================================================================================
+  CAREBRIDGE — TECHNICAL IMPLEMENTATION GUIDE
+  AI-Powered Early Health Triage for Rural India
+  College Project: Well-Being and Good Health
+================================================================================
+
+DOCUMENT VERSION : 1.0
+PROJECT          : CareBridge
+AUTHOR           : College Project Team
+SDGs ADDRESSED   : SDG 3 (Good Health & Well-Being), SDG 10 (Reduced Inequalities)
+AI PLATFORM      : IBM watsonx.ai | IBM Granite | watsonx.governance
+
+--------------------------------------------------------------------------------
+TABLE OF CONTENTS
+--------------------------------------------------------------------------------
+  1.  System Architecture Overview
+  2.  IBM Granite Model Integration
+  3.  Retrieval-Augmented Generation (RAG) Pipeline
+  4.  Agentic AI Workflow
+  5.  Entity Extraction Module
+  6.  Summarization Module
+  7.  Multimodal Input Handling
+  8.  Triage Scoring Engine
+  9.  Escalation & Alert System
+  10. Responsible AI & Governance
+  11. Data Privacy & Compliance
+  12. Deployment Architecture
+  13. API Reference (Conceptual)
+  14. Performance Benchmarks & Targets
+  15. Known Limitations & Mitigations
+
+--------------------------------------------------------------------------------
+1. SYSTEM ARCHITECTURE OVERVIEW
+--------------------------------------------------------------------------------
+
+CareBridge is composed of four functional layers:
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  LAYER 1: INPUT LAYER                                                    │
+  │  Voice → Watson STT → Text                                               │
+  │  Text  → Direct NLU pipeline                                             │
+  │  Image → Watson Visual Recognition + OCR → Structured findings          │
+  │  Docs  → IBM Watson Document Understanding → Extracted clinical data     │
+  └──────────────────────────────────────────────────────────────────────────┘
+                           ↓
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  LAYER 2: PROCESSING LAYER                                               │
+  │  Multilingual normalization (10+ Indian languages → canonical English)  │
+  │  Named Entity Recognition (Granite NER + UMLS ontology mapping)         │
+  │  Context assembly: symptoms + history + vitals + modality outputs        │
+  └──────────────────────────────────────────────────────────────────────────┘
+                           ↓
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  LAYER 3: AI CORE (IBM watsonx.ai)                                       │
+  │  Granite LLM for reasoning and generation                                │
+  │  RAG pipeline for knowledge-grounded responses                           │
+  │  Agentic workflow orchestration (watsonx Orchestrate + LangGraph)        │
+  │  Urgency scoring and triage classification                                │
+  └──────────────────────────────────────────────────────────────────────────┘
+                           ↓
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  LAYER 4: OUTPUT & ACTION LAYER                                          │
+  │  Triage result (Red / Yellow / Green) with explanation                   │
+  │  SOAP-format case summary for health workers                             │
+  │  Escalation trigger (SMS, app alert, automated call)                     │
+  │  Home-care guidance in local language                                    │
+  │  Dashboard update for ASHA worker and PHC supervisor                     │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+--------------------------------------------------------------------------------
+2. IBM GRANITE MODEL INTEGRATION
+--------------------------------------------------------------------------------
+
+Models Used:
+  - granite-13b-chat-v2    : Primary conversational triage and reasoning
+  - granite-8b-instruct-v1 : Entity extraction, summarization, translation
+  - granite-vision-*        : Image analysis for dermatological inputs
+
+Integration via IBM watsonx.ai Python SDK:
+
+  from ibm_watsonx_ai import Credentials
+  from ibm_watsonx_ai.foundation_models import Model
+
+  credentials = Credentials(
+      url="https://us-south.ml.cloud.ibm.com",
+      api_key="<IBM_CLOUD_API_KEY>"
+  )
+
+  model = Model(
+      model_id="ibm/granite-13b-chat-v2",
+      credentials=credentials,
+      project_id="<WATSONX_PROJECT_ID>",
+      params={
+          "decoding_method": "greedy",
+          "max_new_tokens": 512,
+          "temperature": 0.1,        # Low temperature for clinical accuracy
+          "repetition_penalty": 1.1
+      }
+  )
+
+Prompt Engineering Strategy:
+  - System prompt establishes role: "You are a clinical triage support assistant..."
+  - Explicit "DO NOT diagnose" instruction in every system prompt
+  - Structured output format enforced via prompt template (JSON schema)
+  - Chain-of-thought reasoning elicited for urgency scoring
+
+Example Triage Prompt Template:
+  """
+  [SYSTEM] You are CareBridge, a clinical triage support assistant for rural India.
+  You assist ASHA workers and patients with early symptom triage.
+  You MUST NOT provide a diagnosis. Output only a triage level and structured summary.
+  Always cite the guideline reference used for your reasoning.
+
+  [CONTEXT from RAG]
+  {retrieved_guidelines}
+
+  [PATIENT INPUT - Extracted Entities]
+  Patient Age    : {age}
+  Symptoms       : {symptom_list}
+  Duration       : {duration}
+  Severity (1-10): {severity_score}
+  Comorbidities  : {comorbidities}
+  Current Meds   : {medications}
+  Image Findings : {vision_output}
+
+  [TASK]
+  1. Assess urgency level: RED (emergency), YELLOW (needs care soon), GREEN (self-care).
+  2. Provide 2-3 sentence rationale citing symptoms and guideline reference.
+  3. List immediate recommended actions for the ASHA worker.
+  4. Generate a SOAP-format case summary.
+
+  OUTPUT FORMAT: JSON
+  """
+
+--------------------------------------------------------------------------------
+3. RETRIEVAL-AUGMENTED GENERATION (RAG) PIPELINE
+--------------------------------------------------------------------------------
+
+Purpose:
+  Ensures all AI responses are grounded in verified medical knowledge, not
+  hallucinated. Reduces risk of harmful or incorrect clinical guidance.
+
+Knowledge Sources:
+  - Ministry of Health & Family Welfare (MOHFW) clinical guidelines
+  - World Health Organization (WHO) Primary Care protocols
+  - ASHA training manuals and field protocols
+  - National Rural Health Mission (NRHM) standard operating procedures
+  - ICMR clinical decision support documents
+
+Pipeline Components:
+
+  STEP 1: Document Ingestion
+    - PDF/HTML documents chunked into ~500-token passages
+    - Metadata tagged: source, version, chapter, clinical_domain
+    - Chunked documents embedded using Granite embedding model
+
+  STEP 2: Vector Store
+    - Embedding model  : ibm/slate-125m-english-rtrvr (watsonx Discovery)
+    - Vector database  : Milvus (self-hosted) or watsonx.data
+    - Index type       : HNSW (Hierarchical Navigable Small World)
+    - Similarity metric: Cosine similarity
+
+  STEP 3: Query Embedding & Retrieval
+    query_embedding = embed_model.encode(structured_symptom_context)
+    top_k_passages  = vector_db.search(query_embedding, top_k=5)
+    # Reranked by cross-encoder for precision
+
+  STEP 4: Context Augmentation
+    - Retrieved passages prepended to Granite prompt as [CONTEXT]
+    - Source citations included in all outputs for auditability
+    - If confidence < threshold → fallback to "Refer to health worker"
+
+  STEP 5: Grounding Validation
+    - Output checked against retrieved context (attribution score)
+    - Hallucination risk score computed; high-risk outputs flagged
+    - watsonx.governance monitors retrieval quality over time
+
+RAG Architecture Diagram:
+
+  User Input → Embedding → Vector DB → Top-K Passages
+                                             ↓
+                          Granite Prompt + Retrieved Context
+                                             ↓
+                           Grounded Clinical Response
+
+--------------------------------------------------------------------------------
+4. AGENTIC AI WORKFLOW
+--------------------------------------------------------------------------------
+
+CareBridge's core processing is an autonomous multi-step agent that manages
+the full journey from raw input to escalation decision.
+
+Orchestration Framework:
+  - IBM watsonx Orchestrate for production deployment
+  - LangGraph for local development and testing
+
+Agent Steps (Sequential):
+
+  AGENT STEP 1: intake_agent
+    Input  : Raw multimodal data (text/voice/image/doc)
+    Action : Normalize input, translate to English if needed
+    Output : Clean text context
+
+  AGENT STEP 2: entity_extraction_agent
+    Input  : Clean text context
+    Action : Run Granite NER + UMLS mapping
+    Output : Structured JSON {symptoms, duration, severity, history, meds}
+
+  AGENT STEP 3: rag_retrieval_agent
+    Input  : Structured entities (query formulation)
+    Action : Embed query → vector search → rerank
+    Output : Top-5 relevant guideline passages with citations
+
+  AGENT STEP 4: triage_reasoning_agent
+    Input  : Entities + RAG context
+    Action : Granite LLM urgency reasoning with chain-of-thought
+    Output : {urgency: "RED|YELLOW|GREEN", rationale, confidence}
+
+  AGENT STEP 5: summary_generation_agent
+    Input  : All prior outputs
+    Action : Granite generates SOAP case summary (+ local language version)
+    Output : Structured case document
+
+  AGENT STEP 6: escalation_agent
+    Input  : Triage level + summary
+    Action :
+      RED    → Trigger PHC alert (SMS + app push) + log for review
+      YELLOW → Schedule ASHA follow-up + notify worker
+      GREEN  → Generate home-care guide in patient's language
+    Output : Confirmation of alerts sent + audit log entry
+
+LangGraph State Schema (Python pseudocode):
+
+  class TriageState(TypedDict):
+      raw_input       : dict        # multimodal payload
+      clean_text      : str         # normalized text
+      entities        : dict        # extracted medical entities
+      rag_context     : list[str]   # retrieved guideline passages
+      triage_level    : str         # RED / YELLOW / GREEN
+      rationale       : str         # AI reasoning
+      confidence      : float       # 0.0 - 1.0
+      soap_summary    : dict        # S / O / A / P fields
+      alerts_sent     : list[str]   # audit trail
+      session_id      : str         # for logging (no PII)
+
+  graph = StateGraph(TriageState)
+  graph.add_node("intake",       intake_agent)
+  graph.add_node("extract",      entity_extraction_agent)
+  graph.add_node("retrieve",     rag_retrieval_agent)
+  graph.add_node("triage",       triage_reasoning_agent)
+  graph.add_node("summarize",    summary_generation_agent)
+  graph.add_node("escalate",     escalation_agent)
+
+  graph.set_entry_point("intake")
+  graph.add_edge("intake",    "extract")
+  graph.add_edge("extract",   "retrieve")
+  graph.add_edge("retrieve",  "triage")
+  graph.add_edge("triage",    "summarize")
+  graph.add_edge("summarize", "escalate")
+
+--------------------------------------------------------------------------------
+5. ENTITY EXTRACTION MODULE
+--------------------------------------------------------------------------------
+
+Purpose:
+  Convert unstructured free-text symptom descriptions into structured medical
+  entities for consistent downstream processing.
+
+Approach:
+  - Granite 8B Instruct used for instruction-following NER
+  - UMLS (Unified Medical Language System) ontology used for entity normalization
+  - Hybrid: LLM extraction + rule-based post-processing for numeric fields
+
+Entity Types Extracted:
+
+  ENTITY TYPE         EXAMPLE INPUT              EXTRACTED OUTPUT
+  ─────────────────── ──────────────────────     ─────────────────────────────
+  Symptom             "chest dard ho raha hai"   {type: "chest_pain", cui: C0008031}
+  Onset Duration      "teen din se"              {duration: "3 days"}
+  Severity            "bahut zyada dard"         {severity_score: 8/10}
+  Comorbidity         "sugar ki bimari hai"      {condition: "diabetes_mellitus"}
+  Current Medication  "metformin leta hoon"      {drug: "metformin", cui: C0025598}
+  Vital Signs         "bukhaar 103 degree hai"   {vital: "temperature", value: 39.4, unit: "C"}
+  Age / Gender        "55 saal ka mard"          {age: 55, gender: "male"}
+  Pregnancy Status    "7 mahine ki garbhwati"    {pregnant: true, weeks: ~28}
+
+Extraction Prompt (simplified):
+  """
+  Extract all medical entities from the following patient statement.
+  Return valid JSON with keys: symptoms, duration, severity, comorbidities,
+  medications, vitals, demographics.
+  Do NOT infer or add information not present in the input.
+
+  Input: "{patient_text}"
+  """
+
+Post-processing:
+  - Severity normalization: map linguistic expressions to 1-10 scale
+  - Duration normalization: "teen din" → 3 days, "kaafi din se" → "unspecified chronic"
+  - Pregnancy flag → automatic escalation weight adjustment
+
+--------------------------------------------------------------------------------
+6. SUMMARIZATION MODULE
+--------------------------------------------------------------------------------
+
+Output Format: SOAP (Subjective / Objective / Assessment / Plan)
+
+  S (Subjective)  : Patient's own description (in their language + English)
+  O (Objective)   : Extracted vitals, image findings, document data
+  A (Assessment)  : AI triage level + confidence + guideline references
+  P (Plan)        : Recommended immediate actions for ASHA/PHC
+
+Example SOAP Output (JSON):
+  {
+    "session_id"  : "cb-2024-xx-xxxx",
+    "language"    : "Hindi",
+    "triage_level": "YELLOW",
+    "confidence"  : 0.87,
+    "soap": {
+      "S": "55-year-old male reports persistent chest discomfort for 3 days, moderate severity (7/10), associated with mild shortness of breath. Known diabetic on metformin. No prior cardiac history reported.",
+      "O": "Temperature: 99.2°F (reported). Image: No uploaded images. Documents: None.",
+      "A": "Symptoms consistent with possible cardiac or musculoskeletal origin. Diabetes increases cardiac risk. Triage: YELLOW — needs medical evaluation within 24 hours. Ref: MOHFW NCD Management Guidelines Ch.4.",
+      "P": "1. Avoid physical exertion. 2. ASHA to arrange PHC visit within 24 hours. 3. Monitor for worsening (if chest pain radiates to arm/jaw or patient loses consciousness → escalate to RED immediately)."
+    },
+    "local_language_guidance": "Aaram karein aur kal subah PHC mein doctor se milein...",
+    "citations": ["MOHFW_NCD_Guidelines_2023_Ch4", "WHO_IHD_Primary_Care_Protocol"]
+  }
+
+Translation Pipeline:
+  - SOAP summary generated in English first
+  - Patient-facing guidance translated to regional language via Granite
+  - Back-translation check performed to verify accuracy before delivery
+
+--------------------------------------------------------------------------------
+7. MULTIMODAL INPUT HANDLING
+--------------------------------------------------------------------------------
+
+7a. VOICE INPUT
+  Technology   : IBM Watson Speech to Text
+  Languages    : Hindi, Tamil, Telugu, Bengali, Marathi, Gujarati,
+                 Kannada, Odia, Punjabi, Malayalam
+  Pipeline     :
+    Audio file / live stream
+      → Watson STT (language auto-detection)
+      → Raw transcript
+      → Transliteration normalization (Hinglish → canonical)
+      → Feed into NLU pipeline
+
+  Offline Mode : On-device STT using compressed Whisper model for
+                 areas with poor connectivity (< 1MB model)
+
+7b. TEXT INPUT
+  Direct entry via mobile app or USSD (*120# shortcode for feature phones)
+  Supports:
+    - Unicode Hindi/regional scripts
+    - Romanized transliteration (Hinglish)
+    - SMS shorthand patterns
+  Normalization: Language detection → script normalization → NLU pipeline
+
+7c. IMAGE INPUT
+  Technology   : IBM Watson Visual Recognition + Granite Vision
+  Use Cases    :
+    - Skin rashes, wounds, swelling, eye conditions
+    - Prescription label reading
+    - Medicine identification
+  Pipeline     :
+    Image upload (JPEG/PNG, max 5MB)
+      → Image quality check (blur, brightness)
+      → Watson Visual Recognition → structured findings JSON
+      → Granite Vision → clinical description text
+      → Findings injected into entity extraction context
+
+  Privacy Note : Images are processed in memory, never stored permanently.
+                 All visual processing occurs within the secure session.
+
+7d. DOCUMENT INPUT
+  Technology   : IBM Watson Document Understanding
+  Supported Formats : PDF, JPG (scanned), PNG
+  Document Types    :
+    - Hospital discharge summaries
+    - Pathology lab reports (CBC, sugar, urine)
+    - X-ray / scan reports (text extraction from reports)
+    - Previous prescription records
+  Pipeline     :
+    Document upload
+      → OCR (if scanned image)
+      → Watson Document Understanding → key-value extraction
+      → Structured clinical data → merged into patient context
+
+--------------------------------------------------------------------------------
+8. TRIAGE SCORING ENGINE
+--------------------------------------------------------------------------------
+
+Triage Levels:
+
+  🔴 RED — EMERGENCY
+    Definition  : Potentially life-threatening condition requiring immediate care
+    Examples    : Chest pain with radiation, loss of consciousness, severe bleeding,
+                  difficulty breathing, suspected stroke, high fever in infant (<3 months),
+                  eclampsia signs in pregnancy, snakebite
+    Action      : Immediate alert to nearest PHC + ASHA worker + ambulance (108)
+    Response    : < 30 seconds from triage completion
+    Override    : ASHA worker MUST confirm before ambulance dispatch
+
+  🟡 YELLOW — NEEDS CARE SOON
+    Definition  : Significant symptoms requiring professional evaluation within 24–48 hrs
+    Examples    : Persistent fever (>3 days), moderate pain, uncontrolled blood sugar,
+                  respiratory infection with productive cough, wound with signs of infection
+    Action      : Schedule PHC visit; notify ASHA with structured summary
+    Response    : ASHA notified within 5 minutes; appointment within 24 hours
+
+  🟢 GREEN — SELF-CARE / MONITOR
+    Definition  : Minor symptoms manageable at home with guidance
+    Examples    : Common cold, mild headache, minor cuts, mild stomach upset,
+                  first-day of menstruation pain
+    Action      : Home-care instructions delivered in local language; follow-up in 3 days
+    Response    : Guidance delivered immediately; automated check-in reminder set
+
+Urgency Score Formula (internal):
+  urgency_score = Σ (symptom_weight_i × severity_i) × age_factor × comorbidity_multiplier
+  
+  Where:
+    symptom_weight  = red_flag_score from MOHFW/WHO triage tables
+    severity        = extracted severity / 10
+    age_factor      = 1.3 if age < 5 or age > 65, else 1.0
+    comorbidity_multiplier = 1.2 per high-risk condition (diabetes, hypertension, pregnancy)
+
+  Thresholds:
+    score >= 0.75 → RED
+    score >= 0.40 → YELLOW
+    score  < 0.40 → GREEN
+
+  Confidence < 0.65 → Always escalate to YELLOW minimum; flag for human review
+
+--------------------------------------------------------------------------------
+9. ESCALATION & ALERT SYSTEM
+--------------------------------------------------------------------------------
+
+Alert Channels:
+  1. In-App push notification (ASHA worker mobile app)
+  2. SMS via Twilio / BSNL bulk SMS gateway (for feature phones)
+  3. Automated IVR call (for RED-level, ASHA worker's registered number)
+  4. PHC supervisor dashboard update (real-time web dashboard)
+  5. National Health Mission (NHM) reporting API (de-identified, aggregate)
+
+Escalation Flow (RED):
+  1. Triage engine outputs RED
+  2. escalation_agent triggered
+  3. Nearest PHC identified via patient's registered village → PHC mapping
+  4. ASHA worker for that village identified via ASHA registry
+  5. SMS sent to ASHA: case summary + location + recommended action
+  6. PHC dashboard updated: incoming referral flag
+  7. If ASHA does not acknowledge within 10 minutes → escalate to PHC in-charge
+  8. Full audit log created (session ID, timestamp, triage level, alerts sent)
+
+Escalation Flow (YELLOW):
+  1. Triage engine outputs YELLOW
+  2. ASHA worker notified via app push + SMS
+  3. Case summary attached to ASHA's pending cases list
+  4. Appointment slot pre-blocked at nearest PHC (if system integrated)
+  5. Patient receives home-care guidance to follow until visit
+
+Escalation Flow (GREEN):
+  1. Triage engine outputs GREEN
+  2. Home-care instructions generated in regional language
+  3. Delivered via app / SMS / voice read-back
+  4. Automated follow-up reminder set for Day 3
+  5. If symptoms worsen before Day 3, patient re-triaged immediately
+
+Human Override Protocol:
+  - ASHA workers can override ANY AI recommendation at any time
+  - Override reason logged for model improvement
+  - No punitive action for overrides — encouraged as quality control
+
+--------------------------------------------------------------------------------
+10. RESPONSIBLE AI & GOVERNANCE
+--------------------------------------------------------------------------------
+
+10a. FAIRNESS
+  Framework : IBM AI Fairness 360 (AIF360)
+  Monitored Attributes:
+    - Gender (male / female / other)
+    - Age group (child / adult / elderly)
+    - Religion (no differential treatment)
+    - Caste / tribal status (no differential weighting)
+    - Geographic region (urban-adjacent vs. remote)
+  
+  Metrics Tracked:
+    - Equalized odds (TPR parity across groups)
+    - Demographic parity in triage level distribution
+    - False negative rate (missed RED cases) by demographic
+  
+  Triggers:
+    - Fairness metric deviation > 5% → automatic re-evaluation
+    - Systematic false negative rate > 2% for any group → halt + retrain
+
+10b. EXPLAINABILITY
+  Framework : SHAP (SHapley Additive exPlanations) + Granite chain-of-thought
+  
+  Every triage output includes:
+    1. Top 3 symptoms driving the urgency score (with weights)
+    2. Guideline reference(s) consulted via RAG
+    3. Confidence score with uncertainty acknowledgment
+    4. Plain-language explanation for ASHA worker
+  
+  Example explanation:
+    "Urgency level YELLOW because: (1) fever lasting 4+ days [weight: 0.35],
+     (2) productive cough [weight: 0.28], (3) known diabetic [risk multiplier: 1.2].
+     Reference: MOHFW Respiratory Illness Guidelines 2023, Section 3.2."
+
+10c. PRIVACY
+  - No PII stored after session close
+  - Patient data referenced by anonymized session ID only
+  - Voice audio deleted after transcription
+  - Images processed in memory, not persisted
+  - All data encrypted in transit (TLS 1.3) and at rest (AES-256)
+  - Data residency: India (Mumbai data center) only
+  - Compliant with: DISHA, IT Act 2000, SPDI Rules 2011
+
+10d. HUMAN-IN-THE-LOOP
+  - RED escalations: ASHA worker confirmation required before ambulance dispatch
+  - Model outputs are advisory; no automated medical intervention
+  - ASHA workers trained to challenge, override, and report AI errors
+  - Clinical panel reviews 100% of RED cases weekly
+
+10e. CONTINUOUS GOVERNANCE
+  Tool     : IBM watsonx.governance
+  Monitors :
+    - Model drift (input distribution shift)
+    - Output quality degradation
+    - Guideline staleness (new MOHFW/WHO publications)
+    - Adverse event correlation (was a GREEN case later hospitalized?)
+  
+  Cadence:
+    - Real-time monitoring dashboard
+    - Weekly automated fairness reports
+    - Monthly clinical audit by domain experts
+    - Quarterly model retraining with accumulated feedback
+
+--------------------------------------------------------------------------------
+11. DATA PRIVACY & COMPLIANCE
+--------------------------------------------------------------------------------
+
+Regulatory Framework:
+  - DISHA (Digital Information Security in Healthcare Act, draft)
+  - Information Technology Act 2000 + SPDI Rules 2011
+  - National Digital Health Mission (NDHM) data standards
+  - ISO/IEC 27001 Information Security Management
+
+Data Classification:
+  CATEGORY          SENSITIVITY  STORAGE       RETENTION
+  ──────────────    ───────────  ────────      ─────────────
+  Session transcript HIGH         Encrypted     Session duration only
+  Extracted entities MEDIUM       Anonymized    7 days (audit)
+  Triage outcome     MEDIUM       De-identified 90 days (quality)
+  Aggregate stats    LOW          Aggregate     Indefinite (NHM reporting)
+  Voice/Image files  CRITICAL     Memory only   Purged after processing
+
+Consent Flow:
+  1. On first use: patient / ASHA reads (or hears) consent statement
+  2. Consent recorded as yes/no with timestamp
+  3. Session proceeds only after affirmative consent
+  4. Withdrawal of consent clears all data within 24 hours
+
+--------------------------------------------------------------------------------
+12. DEPLOYMENT ARCHITECTURE
+--------------------------------------------------------------------------------
+
+Environments:
+  - Development  : Local Docker + LangGraph + Milvus (laptop / VM)
+  - Staging      : IBM Cloud Kubernetes Service (IKS) — Mumbai region
+  - Production   : IBM Cloud IKS with autoscaling; 99.9% SLA target
+
+Components:
+  - Frontend     : React Native mobile app (Android-first for rural India)
+                   Progressive Web App (PWA) for low-end browsers
+                   USSD interface (*120# shortcode via BSNL/Airtel)
+  - Backend API  : FastAPI (Python 3.11) + Uvicorn
+  - AI Services  : IBM watsonx.ai (Granite) via REST API
+  - Vector DB    : Milvus on IBM Cloud (managed)
+  - Alert Engine : Celery + Redis for async task queue
+  - SMS Gateway  : Twilio (primary) / BSNL Bulk SMS (fallback)
+  - Monitoring   : IBM Instana + watsonx.governance dashboards
+
+Offline / Low-Connectivity Mode:
+  - Lite triage available fully offline using compressed on-device model
+  - Sync to server when connectivity restored (queue-based)
+  - USSD fallback for no-internet feature phones
+
+--------------------------------------------------------------------------------
+13. API REFERENCE (CONCEPTUAL)
+--------------------------------------------------------------------------------
+
+BASE URL: https://api.carebridge.in/v1
+
+POST /triage
+  Description : Submit patient input for triage
+  Auth        : Bearer token (ASHA worker authenticated session)
+  Request body:
+    {
+      "session_id"   : "uuid",
+      "input_type"   : "text | voice | image | document",
+      "content"      : "base64 or raw text",
+      "language"     : "hi | ta | te | bn | mr | ...",
+      "patient_meta" : { "age": 45, "gender": "F", "village_code": "MH-1234" }
+    }
+  Response:
+    {
+      "triage_level" : "RED | YELLOW | GREEN",
+      "confidence"   : 0.91,
+      "rationale"    : "...",
+      "soap_summary" : { "S": "...", "O": "...", "A": "...", "P": "..." },
+      "guidance"     : "local language home-care text",
+      "citations"    : ["MOHFW_2023_Ch4"],
+      "escalation"   : { "triggered": true, "asha_notified": true, "phc_alerted": false }
+    }
+
+GET /session/{session_id}/audit
+  Description : Retrieve audit log for a session (ASHA / supervisor only)
+  Returns     : Full decision trail, entities, RAG sources, timestamps
+
+POST /feedback
+  Description : ASHA worker submits correction/feedback on a triage outcome
+  Body        : { "session_id": "uuid", "correct_level": "RED", "notes": "..." }
+
+GET /guidelines/search?q={query}
+  Description : Search the knowledge base (for ASHA training mode)
+  Returns     : Top-5 relevant guideline passages with citations
+
+--------------------------------------------------------------------------------
+14. PERFORMANCE BENCHMARKS & TARGETS
+--------------------------------------------------------------------------------
+
+METRIC                          TARGET          MEASUREMENT METHOD
+──────────────────────────────  ──────────────  ─────────────────────────────
+Triage accuracy (vs PHC nurse)  ≥ 92%           Retrospective clinical audit
+False negative rate (RED cases) < 2%            Monthly audit of escalations
+Average triage time             < 3 minutes     App telemetry
+System availability             ≥ 99.5%         IBM Cloud SLA
+Response latency (API p95)      < 4 seconds     Instana monitoring
+Supported languages             ≥ 10            QA acceptance testing
+Voice recognition accuracy      ≥ 88% (rural    Watson STT eval
+                                 accents)
+RAG retrieval precision@5       ≥ 0.82          Offline evaluation set
+Fairness (TPR parity)           ≤ 5% deviation  AIF360 monthly report
+Annual beneficiaries (Year 1)   500,000+        NHM usage reporting
+
+--------------------------------------------------------------------------------
+15. KNOWN LIMITATIONS & MITIGATIONS
+--------------------------------------------------------------------------------
+
+LIMITATION                              MITIGATION
+──────────────────────────────────────  ──────────────────────────────────────
+LLM hallucinations in rare conditions   RAG grounding; attribution score check;
+                                        fallback to "consult health worker"
+
+Regional dialect gaps in STT            Continuous STT model fine-tuning;
+                                        text correction feedback loop from ASHAs
+
+Image quality in low-light rural         Image quality pre-screening; user
+settings                                coaching prompts; fallback to text
+
+Connectivity outages in remote areas    Offline compressed model; USSD backup;
+                                        async sync queue
+
+Misuse / over-reliance on AI            Mandatory ASHA human confirmation for RED;
+                                        prominent disclaimers at every output
+
+Guideline staleness                     watsonx.governance staleness detection;
+                                        quarterly RAG knowledge base refresh
+
+Bias from historical health data        AIF360 audits; diverse training data;
+skewed toward urban populations         rural-specific evaluation benchmarks
+
+Low smartphone literacy among           Voice-first design; USSD option;
+patients and some ASHAs                 ASHA training program (3-day onboarding)
+
+================================================================================
+END OF IMPLEMENTATION DOCUMENT
+CareBridge — Bridging the Healthcare Gap, One Triage at a Time
+Built with IBM Granite · watsonx.ai · watsonx.governance
+================================================================================
